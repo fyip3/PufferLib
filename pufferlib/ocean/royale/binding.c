@@ -5,6 +5,22 @@
 static int my_init(Env* env, PyObject* args, PyObject* kwargs){
   int L = unpack(kwargs, "length");
   env->length = (L > 0) ? L : 11;
+
+  // Initialize environment state (but DON'T allocate obs/actions/rewards/terminals)
+  env->tick = 0;
+  env->width = WIDTH;
+  env->height = HEIGHT;
+  env->obs_size = WIDTH * HEIGHT + 4;
+  env->num_units = 0;
+  memset(&env->log, 0, sizeof(Log));
+
+  // Allocate environment-specific buffers (NOT the Python numpy arrays)
+  env->grid = (unsigned char*)calloc(WIDTH * HEIGHT, sizeof(unsigned char));
+  env->units = (Unit*)calloc(MAX_UNITS, sizeof(Unit));
+
+  env->action_mask_size = 9;  // 0..8: 0=noop, lane0 1-4, lane1 5-8
+  env->action_mask = (unsigned char*)calloc(env->action_mask_size, 1);
+
   return 0;
 }
 static int my_log(PyObject* dict, Log* log){

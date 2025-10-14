@@ -16,12 +16,13 @@ class Royale(pufferlib.PufferEnv):
         if isinstance(log_interval, str):
             log_interval = int(log_interval)
 
-        # Royale: two lanes of length `size` + 4 tower slots
-        obs_len = 2 * size + 4
+        # Royale: grid is WIDTH * HEIGHT + 4 (tower health + elixir)
+        # WIDTH = 20, HEIGHT = 10, so obs = 200 + 4 = 204
+        obs_len = 20 * 10 + 4
         self.single_observation_space = gymnasium.spaces.Box(
-            low=0, high=255, shape=(obs_len,), dtype=np.uint8
+            low=0, high=1.0, shape=(obs_len,), dtype=np.float32
         )
-        # Royale action space: 7 discrete actions
+        # Royale action space: 0=noop, 1=knight, 2=archer, 3=tank
         self.single_action_space = gymnasium.spaces.Discrete(7)
 
         self.render_mode = render_mode
@@ -29,6 +30,9 @@ class Royale(pufferlib.PufferEnv):
         self.log_interval = log_interval
 
         super().__init__(buf)
+        # Convert actions to float32 to match C expectations
+        self.actions = self.actions.astype(np.float32)
+
         # Must use 'length=size' to match C binding keyword
         self.c_envs = binding.vec_init(
             self.observations,
@@ -77,7 +81,7 @@ if __name__ == "__main__":
     steps = 0
 
     CACHE = 1024
-    actions = np.random.randint(0, 7, (CACHE, N))
+    actions = np.random.randint(0, 4, (CACHE, N))  # 4 actions: 0-3
 
     i = 0
     import time

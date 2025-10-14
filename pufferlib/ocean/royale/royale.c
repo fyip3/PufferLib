@@ -8,7 +8,7 @@ int main(){
   c_reset(&env);
 
   while (!WindowShouldClose()){
-    env.actions[0] = rand() % 7;
+    env.actions[0] = rand() % 9;
     c_step(&env);
     c_render(&env);
   }

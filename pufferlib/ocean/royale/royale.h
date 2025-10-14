@@ -1,549 +1,661 @@
-#ifndef ROYALE_H
-#define ROYALE_H
-
 #include <stdlib.h>
 #include <string.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <time.h>
 #include <stdio.h>
+#include <stdbool.h>
+#include <math.h>
+#include <time.h>
 #include "raylib.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+// ==============================
+// Config
+// ==============================
+#define WIDTH 20
+#define HEIGHT 10
+#define CELL_SIZE 32
+#define MAX_UNITS 128
+#define MAX_TICKS 3600  // 60 seconds at 60fps
 
-//  Constants 
+// Two-lane setup
 #define LANES 2
+#define LANE0_Y (HEIGHT/3)
+#define LANE1_Y (HEIGHT - 1 - HEIGHT/3)
+
+// Tile types
 #define EMPTY 0
-#define BOARD_X 48      
-#define RIGHT_GUTTER 48 
+#define TOWER_PLAYER 1
+#define TOWER_ENEMY 2
+#define KNIGHT_PLAYER 3
+#define ARCHER_PLAYER 4
+#define TANK_PLAYER 5
+#define KNIGHT_ENEMY 6
+#define ARCHER_ENEMY 7
+#define TANK_ENEMY 8
+#define FLYING_PLAYER 9
+#define FLYING_ENEMY  10
+#define TILE_MAX 10
 
-// Player units
-#define P_MELEE  1
-#define P_RANGED 2
-#define P_FLYING 3
-// Enemy units
-#define E_MELEE  11
-#define E_RANGED 12
-#define E_FLYING 13
+// Troop types
+#define TROOP_KNIGHT 1
+#define TROOP_ARCHER 2
+#define TROOP_TANK   3
+#define TROOP_FLYING 4
 
-// Animation / render
-#define CELL_PX     48
-#define ANIM_SPEED   8   // ticks per frame swap
+// Elixir
+#define ELIXIR_START 10.0f
+#define ELIXIR_MAX 10.0f
+#define ELIXIR_REGEN 0.02f  // per frame
 
-// Smooth movement config
-#ifndef RENDERS_PER_STEP
-#define RENDERS_PER_STEP 15
+// Toggle to play as the enemy (team=1) with the keyboard
+#ifndef ENEMY_MANUAL
+#define ENEMY_MANUAL 0   // set to 0 to restore AI
 #endif
 
-// Gameplay
-#define TOWER_HP_INIT    20
-#define ENEMY_SPAWN_ODDS 1
-#define MAX_TICKS_FACTOR 8
+// ==============================
+// Types
+// ==============================
+typedef struct Log Log;
+struct Log {
+    float perf;
+    float score;
+    float episode_return;
+    float episode_length;
+    float n;
+};
 
-//  Logs / Env 
-typedef struct {
-    float perf, score, episode_return, episode_length, n;
-} Log;
+typedef struct Unit Unit;
+struct Unit {
+    int type;          // TROOP_*
+    float x, y;        // position
+    float health;
+    float max_health;
+    float damage;
+    float speed;
+    float range;
+    float attack_cooldown;
+    float attack_rate;
+    int team;          // 0 = player, 1 = enemy
+    int active;
+    unsigned char lock_tower;
+};
 
-typedef struct {
-    Log            log;
-    unsigned char* observations;  // [2*L] + [2 base bytes]
-    int*           actions;       // [1]
-    float*         rewards;       // [1]
-    unsigned char* terminals;     // [1]
+typedef struct RoyaleEnv RoyaleEnv;
+struct RoyaleEnv {
+    float* observations;
+    float* actions;
+    float* rewards;
+    unsigned char* terminals;
+    Log log;
 
-    int length;
+    // Game state
+    unsigned char* grid;
+    Unit* units;
+    int num_units;
+    float tower_player_health;
+    float tower_enemy_health;
+    float elixir_player;
+    float elixir_enemy;
     int tick;
-    int p_base;
-    int e_base;
 
-    // --- Clash flash (visual only): countdown per tile; size = 2*length ---
-    unsigned char* flash;
-} RoyaleEnv;
+    // Sprite textures
+    Texture2D knight_sprite;
+    Texture2D archer_sprite;
+    Texture2D golem_sprite;
+    Texture2D dragon_sprite;
+    bool sprites_loaded;
 
-// ---- Smooth-move globals (no ABI change) ----
-static unsigned char* g_prev = NULL; // size = 2*length
-static int            g_prev_len = 0;
-static float          g_lerp = 1.0f; // 0..1 interpolation progress
+    // Config
+    int width;
+    int height;
+    int obs_size;
+    int length;  // For compatibility with binding.c
 
-//  Helpers 
-static inline int board_size(RoyaleEnv* env) { return 2 * env->length; }
-static inline int obs_p_base(RoyaleEnv* env) { return board_size(env) + 0; }
-static inline int obs_e_base(RoyaleEnv* env) { return board_size(env) + 1; }
+    // ===== Action mask (NEW) =====
+    unsigned char* action_mask; // size 9: 0..8 (0=noop)
+    int action_mask_size;       // = 9
+};
 
-static inline int is_player(unsigned char v) { return v > 0 && v < 10; }
-static inline int is_enemy (unsigned char v) { return v >= 10; }
-static inline unsigned char norm(unsigned char v){ return v ? (v>=10 ? v-10 : v) : 0; }
+// ==============================
+// Troop stats
+// ==============================
+typedef struct TroopStats {
+    float health;
+    float damage;
+    float speed;
+    float range;
+    float attack_rate;
+    int cost;
+} TroopStats;
 
-// RPS: melee(1) > ranged(2), ranged(2) > flying(3), flying(3) > melee(1)
-static inline int beats(unsigned char a, unsigned char b){
-    a = norm(a); b = norm(b);
-    if (a == 0 || b == 0 || a == b) return 0;
-    return (a == 1 && b == 2) || (a == 2 && b == 3) || (a == 3 && b == 1);
+// Added Flying unit (index 4)
+static const TroopStats TROOP_DATA[] = {
+    {0,   0,   0.0f, 0.0f,   0, 0},    // 0 = none
+   //HP   DMG  SPEED  RANGE  ATK_RATE  COST
+    {130, 15,  1.00f, 1.20f,    45,     3},  // 1 = Knight  (slight nerf: atk slower, a bit less HP)
+    { 60,  7,  0.90f, 4.80f,    28,     2},  // 2 = Archer  (anti-air; a touch slower/weaker vs ground)
+    {420, 50,  0.70f, 1.80f,    45,     5},  // 3 = Tank    (buffed: bigger HP/DMG/range; higher cost -> save pays off)
+    {100, 30,  1.25f, 2.00f,    28,     4},  // 4 = Flying  (buffed: faster/stronger; still loses hard to Archer via your 2x bonus)
+};
+
+// ==============================
+// Helpers for flying rules
+// ==============================
+static inline bool is_flying_type(int t) { return t == TROOP_FLYING; }
+static inline bool can_attack_type(int attacker_type, int target_type) {
+    // Knights & Tanks cannot hit air
+    if ((attacker_type == TROOP_KNIGHT || attacker_type == TROOP_TANK) &&
+        is_flying_type(target_type)) return false;
+    // Archers & Flying can hit everything
+    return true;
 }
 
-static inline void write_bases(RoyaleEnv* env) {
-    env->observations[obs_p_base(env)] = env->p_base > 0 ? env->p_base : 0;
-    env->observations[obs_e_base(env)] = env->e_base > 0 ? env->e_base : 0;
-}
-static inline void add_log(RoyaleEnv* env) {
-    env->log.perf += (env->rewards[0] > 0);
-    env->log.score += env->rewards[0];
-    env->log.episode_length++;
-    env->log.episode_return += env->rewards[0];
-    env->log.n++;
-}
-
-//  Sprites 
-static Texture2D tex_melee, tex_ranged, tex_flying;
-static bool sprites_loaded = false;
-static int  frame_w = 32, frame_h = 32;   // will be auto-detected from textures
-
-static inline bool try_load(Texture2D* out, const char* a, const char* b, const char* c) {
-    if (FileExists(a)) { *out = LoadTexture(a); return out->id != 0; }
-    if (b && FileExists(b)) { *out = LoadTexture(b); return out->id != 0; }
-    if (c && FileExists(c)) { *out = LoadTexture(c); return out->id != 0; }
-    return false;
-}
-static inline void load_sprites_once(void) {
-    if (sprites_loaded) return;
-
-    bool okM = try_load(&tex_melee,
-        "pufferlib/ocean/royale/assets/melee.png",
-        "./pufferlib/ocean/royale/assets/melee.png",
-        "assets/melee.png");
-    bool okR = try_load(&tex_ranged,
-        "pufferlib/ocean/royale/assets/ranged.png",
-        "./pufferlib/ocean/royale/assets/ranged.png",
-        "assets/ranged.png");
-    bool okF = try_load(&tex_flying,
-        "pufferlib/ocean/royale/assets/flying.png",
-        "./pufferlib/ocean/royale/assets/flying.png",
-        "assets/flying.png");
-
-    sprites_loaded = okM && okR && okF;
-
-    // Auto-detect frame size (assumes 2 frames horizontally)
-    if (tex_melee.id != 0) {
-        frame_w = tex_melee.width / 2;
-        frame_h = tex_melee.height;
-    }
+// ==============================
+// Logging
+// ==============================
+void add_log(RoyaleEnv* env) {
+    float score = env->tower_player_health - env->tower_enemy_health;
+    env->log.episode_length += env->tick;
+    env->log.episode_return += score;
+    env->log.score += score;
+    env->log.perf += (env->tower_player_health > env->tower_enemy_health) ? 1.0f : 0.0f;
+    env->log.n += 1;
 }
 
-//  Memory 
-static inline void allocate(RoyaleEnv* env) {
-    int obs_size = 2 * env->length + 2;
-    env->observations = (unsigned char*)calloc(obs_size, sizeof(unsigned char));
-    env->actions      = (int*)calloc(1, sizeof(int));
-    env->rewards      = (float*)calloc(1, sizeof(float));
-    env->terminals    = (unsigned char*)calloc(1, sizeof(unsigned char));
-    env->flash        = (unsigned char*)calloc(2 * env->length, 1);  // for clash flash
-
-    // allocate / resize global prev buffer
-    int need = 2 * env->length;
-    if (g_prev_len != need) {
-        free(g_prev);
-        g_prev = (unsigned char*)calloc(need, 1);
-        g_prev_len = need;
-    }
-    g_lerp = 1.0f;
+void init(RoyaleEnv* env) {
+    env->tick = 0;
+    env->width = WIDTH;
+    env->height = HEIGHT;
+    env->obs_size = WIDTH * HEIGHT + 4;  // grid + tower HPs + elixirs
+    env->num_units = 0;
+    env->sprites_loaded = false;
+    memset(&env->log, 0, sizeof(Log));
 }
-static inline void free_allocated(RoyaleEnv* env) {
+
+void allocate(RoyaleEnv* env) {
+    init(env);
+    env->grid = (unsigned char*)calloc(WIDTH * HEIGHT, sizeof(unsigned char));
+    env->units = (Unit*)calloc(MAX_UNITS, sizeof(Unit));
+    env->observations = (float*)calloc(env->obs_size, sizeof(float));
+    env->actions = (float*)calloc(1, sizeof(float));
+    env->rewards = (float*)calloc(1, sizeof(float));
+    env->terminals = (unsigned char*)calloc(1, sizeof(unsigned char));
+
+    // action mask (NEW)
+    env->action_mask_size = 9;
+    env->action_mask = (unsigned char*)calloc(env->action_mask_size, 1);
+}
+
+void free_allocated(RoyaleEnv* env) {
+    free(env->grid);
+    free(env->units);
     free(env->observations);
     free(env->actions);
     free(env->rewards);
     free(env->terminals);
-    free(env->flash);
-
-    env->observations = env->actions = env->rewards = env->terminals = NULL;
-    env->flash = NULL;
-
-    // free global prev buffer
-    free(g_prev);
-    g_prev = NULL;
-    g_prev_len = 0;
-    g_lerp = 1.0f;
+    free(env->action_mask); // NEW
 }
 
-//  Setup 
-static inline void c_reset(RoyaleEnv* env) {
-    memset(env->observations, 0, board_size(env) + 2);
-    if (env->flash) memset(env->flash, 0, 2 * env->length);
-    if (g_prev) memset(g_prev, 0, 2 * env->length);
-    g_lerp = 1.0f;
+void c_close(RoyaleEnv* env) {
+    // Unload sprites if loaded
+    if (env->sprites_loaded) {
+        UnloadTexture(env->knight_sprite);
+        UnloadTexture(env->archer_sprite);
+        UnloadTexture(env->golem_sprite);
+        UnloadTexture(env->dragon_sprite);
+        env->sprites_loaded = false;
+    }
 
-    env->p_base = TOWER_HP_INIT;
-    env->e_base = TOWER_HP_INIT;
+    // Free environment-specific buffers (NOT the Python numpy arrays)
+    if (env->grid) {
+        free(env->grid);
+        env->grid = NULL;
+    }
+    if (env->units) {
+        free(env->units);
+        env->units = NULL;
+    }
+    // Close raylib window if it's open
+    if (IsWindowReady()) {
+        CloseWindow();
+    }
+}
+
+// ==============================
+// Unit management
+// ==============================
+int spawn_unit(RoyaleEnv* env, int type, int team, int lane) {
+    if (lane < 0 || lane >= LANES) return -1;
+    if (env->num_units >= MAX_UNITS) return -1;
+
+    const TroopStats* stats = &TROOP_DATA[type];
+
+    // Check elixir
+    float* elixir = (team == 0) ? &env->elixir_player : &env->elixir_enemy;
+    if (*elixir < stats->cost) return -1;
+
+    Unit* u = &env->units[env->num_units];
+    u->type = type;
+    u->health = stats->health;
+    u->max_health = stats->health;
+    u->damage = stats->damage;
+    u->speed = stats->speed;
+    u->range = stats->range;
+    u->attack_rate = stats->attack_rate;
+    u->attack_cooldown = 0;
+    u->team = team;
+    u->active = 1;
+    u->lock_tower = 0;  
+
+    // Spawn position
+    u->x = (team == 0) ? 2.0f : (float)(WIDTH - 3);
+    u->y = (lane == 0) ? (float)LANE0_Y : (float)LANE1_Y;
+
+    *elixir -= stats->cost;
+    env->num_units++;
+    return env->num_units - 1;
+}
+static inline int random_affordable_enemy_type(RoyaleEnv* env){
+    int candidates[4]; int n = 0;
+    for (int t = 1; t <= 4; ++t){
+        if (TROOP_DATA[t].cost <= 3 &&
+            env->elixir_enemy >= (float)TROOP_DATA[t].cost){
+            candidates[n++] = t;
+        }
+    }
+    if (n == 0) return 0;              // nothing affordable → skip this tick
+    return candidates[rand() % n];      // pick a cheap, affordable type
+}
+
+// ==============================
+// Action mask helpers (NEW)
+// ==============================
+static inline void update_action_mask(RoyaleEnv* env) {
+    // 9 discrete actions: 0=noop,
+    // lane 0: 1=K,2=A,3=T,4=F
+    // lane 1: 5=K,6=A,7=T,8=F
+    memset(env->action_mask, 0, env->action_mask_size);
+    env->action_mask[0] = 1;  // noop always allowed
+
+    if (env->num_units >= MAX_UNITS) return;
+
+    float e = env->elixir_player;
+
+    for (int t = 1; t <= 4; ++t) {
+        int cost = TROOP_DATA[t].cost;
+        unsigned char ok = (e >= (float)cost);
+        env->action_mask[t]     = ok; // lane 0 (1..4)
+        env->action_mask[4 + t] = ok; // lane 1 (5..8)
+    }
+}
+
+static inline void set_terminal_mask(RoyaleEnv* env) {
+    memset(env->action_mask, 0, env->action_mask_size);
+    env->action_mask[0] = 1;  // only noop allowed on terminal frame
+}
+
+// ==============================
+// Observations
+// ==============================
+void compute_observations(RoyaleEnv* env) {
+    // Clear grid
+    memset(env->grid, EMPTY, WIDTH * HEIGHT);
+
+    // Single base per side, drawn once (center row)
+    env->grid[(HEIGHT/2) * WIDTH + 1]         = TOWER_PLAYER;
+    env->grid[(HEIGHT/2) * WIDTH + (WIDTH-2)] = TOWER_ENEMY;
+
+    // Draw units (explicit mapping to support flying)
+    for (int i = 0; i < env->num_units; i++) {
+        Unit* u = &env->units[i];
+        if (!u->active) continue;
+
+        int gx = (int)u->x;
+        int gy = (int)u->y;
+        if (gx >= 0 && gx < WIDTH && gy >= 0 && gy < HEIGHT) {
+            int tile = EMPTY;
+            if (u->team == 0) {
+                if      (u->type == TROOP_KNIGHT) tile = KNIGHT_PLAYER;
+                else if (u->type == TROOP_ARCHER) tile = ARCHER_PLAYER;
+                else if (u->type == TROOP_TANK)   tile = TANK_PLAYER;
+                else if (u->type == TROOP_FLYING) tile = FLYING_PLAYER;
+            } else {
+                if      (u->type == TROOP_KNIGHT) tile = KNIGHT_ENEMY;
+                else if (u->type == TROOP_ARCHER) tile = ARCHER_ENEMY;
+                else if (u->type == TROOP_TANK)   tile = TANK_ENEMY;
+                else if (u->type == TROOP_FLYING) tile = FLYING_ENEMY;
+            }
+            env->grid[gy * WIDTH + gx] = tile;  // y * WIDTH + x
+        }
+    }
+
+    // Fill observations: normalized grid values
+    for (int i = 0; i < WIDTH * HEIGHT; i++) {
+        env->observations[i] = env->grid[i] / (float)TILE_MAX;
+    }
+
+    // Add tower health and elixir
+    env->observations[WIDTH * HEIGHT + 0] = env->tower_player_health / 1000.0f;
+    env->observations[WIDTH * HEIGHT + 1] = env->tower_enemy_health / 1000.0f;
+    env->observations[WIDTH * HEIGHT + 2] = env->elixir_player / ELIXIR_MAX;
+    env->observations[WIDTH * HEIGHT + 3] = env->elixir_enemy / ELIXIR_MAX;
+}
+
+// ==============================
+// Reset
+// ==============================
+void c_reset(RoyaleEnv* env) {
     env->tick = 0;
-    env->terminals[0] = 0;
-    env->rewards[0] = 0;
-    write_bases(env);
+    env->num_units = 0;
+    env->tower_player_health = 1000.0f;
+    env->tower_enemy_health = 1000.0f;
+    env->elixir_player = ELIXIR_START;
+    env->elixir_enemy = ELIXIR_START;
+
+    memset(env->grid, EMPTY, WIDTH * HEIGHT);
+    memset(env->units, 0, MAX_UNITS * sizeof(Unit));
+
+    compute_observations(env);
+    update_action_mask(env); // keep mask consistent after reset (NEW)
 }
 
-//  Spawns 
-static inline void try_spawn_player(RoyaleEnv* env, int lane, unsigned char unit) {
-    int idx = lane * env->length + 0;
-    if (!env->observations[idx]) env->observations[idx] = unit;
-}
-static inline void maybe_spawn_enemy(RoyaleEnv* env, int lane) {
-    if (ENEMY_SPAWN_ODDS <= 0) return;
-    if (rand() % ENEMY_SPAWN_ODDS) return;
-    int idx = lane * env->length + (env->length - 1);
-    if (!env->observations[idx]) {
-        int r = rand() % 3;
-        env->observations[idx] = (r == 0) ? E_MELEE : (r == 1) ? E_RANGED : E_FLYING;
-    }
-}
-
-//  Movement & Resolution 
-// Prevents pass-through and allows sequential same-tick fights (chain resolution).
-static inline void move_and_resolve(RoyaleEnv* env) {
-    const int L = env->length;
-    const int N = board_size(env);
-    unsigned char *cur  = env->observations;
-    unsigned char *next = (unsigned char*)calloc(N, 1);     // next board state
-
-    for (int lane = 0; lane < 2; lane++) {
-        // Per-lane scratch
-        unsigned char *pprop = (unsigned char*)calloc(L, 1);  // player proposals
-        unsigned char *eprop = (unsigned char*)calloc(L, 1);  // enemy proposals
-        unsigned char *used  = (unsigned char*)calloc(L, 1);  // original positions consumed by a swap
-        unsigned char *occ   = (unsigned char*)calloc(L, 1);  // occupants from resolved swaps (can be challenged)
-
-        // ---------- Phase 1: resolve swap conflicts (P at i, E at i+1, both moving) ----------
-        for (int i = 0; i < L-1; i++) {
-            unsigned char P = cur[lane*L + i];
-            unsigned char E = cur[lane*L + (i+1)];
-            if (!is_player(P) || !is_enemy(E)) continue;
-
-            bool p_will_move = (i < L-2);     // player holds in [L-2, L-1]
-            bool e_will_move = (i+1 > 1);     // enemy holds in [0,1]
-            if (!p_will_move || !e_will_move) continue; // not a swap attempt
-
-            unsigned char np = norm(P), ne = norm(E);
-            int winner = 0; // 0=mutual kill, 1=player wins, 2=enemy wins
-            if (np == ne) winner = 0;
-            else if (beats(P, E)) winner = 1;
-            else if (beats(E, P)) winner = 2;
-
-            if (winner == 1) {
-                int dst = i+1;
-                occ[dst] = P;                 // place winner as occupant (not final yet)
-                if (env->flash) env->flash[lane*L + dst] = 10;
-            } else if (winner == 2) {
-                int dst = i;
-                occ[dst] = E;
-                if (env->flash) env->flash[lane*L + dst] = 10;
-            } else {
-                // mutual kill: flash both cells
-                if (env->flash) {
-                    env->flash[lane*L + i]   = 10;
-                    env->flash[lane*L + i+1] = 10;
-                }
-            }
-            used[i]   = 1;
-            used[i+1] = 1;
-            i++; // skip partner cell
-        }
-
-        // ---------- Phase 2: build proposals for remaining movers (skip consumed) ----------
-        // Players (front to back so frontmost overwrites)
-        for (int i = L - 1; i >= 0; i--) {
-            if (used[i]) continue;
-            unsigned char u = cur[lane*L + i];
-            if (!is_player(u)) continue;
-            int target = (i >= L - 2) ? i : i + 1;  // hold in stop zone
-            pprop[target] = u;  // allow contesting occ[target] later
-        }
-        // Enemies (front to back so frontmost overwrites)
-        for (int i = 0; i < L; i++) {
-            if (used[i]) continue;
-            unsigned char u = cur[lane*L + i];
-            if (!is_enemy(u)) continue;
-            int target = (i <= 1) ? i : i - 1;  // hold in stop zone
-            eprop[target] = u;
-        }
-
-        // ---------- Phase 3: sequential per-tile resolution (including challenges vs occ) ----------
-        for (int i = 0; i < L; i++) {
-            int idx = lane*L + i;
-
-            unsigned char survivor = occ[i];   // 0 if no swap winner
-            bool fought = false;
-
-            // If an occupant exists, let incoming opposite-side challengers fight it (in order).
-            if (survivor) {
-                // Player challenger?
-                if (pprop[i] && is_enemy(survivor)) {
-                    if (norm(pprop[i]) == norm(survivor)) {
-                        survivor = 0; fought = true;
-                    } else if (beats(pprop[i], survivor)) {
-                        survivor = pprop[i]; fought = true;
-                    } else if (beats(survivor, pprop[i])) {
-                        fought = true; // survivor stays
-                    }
-                }
-                // Enemy challenger?
-                if (survivor && eprop[i] && is_player(survivor)) {
-                    if (norm(eprop[i]) == norm(survivor)) {
-                        survivor = 0; fought = true;
-                    } else if (beats(eprop[i], survivor)) {
-                        survivor = eprop[i]; fought = true;
-                    } else if (beats(survivor, eprop[i])) {
-                        fought = true; // survivor stays
-                    }
-                }
-
-                next[idx] = survivor;
-                if (fought && env->flash) env->flash[idx] = 10;
-                continue;
-            }
-
-            // No occupant from swaps: resolve proposals as usual (and allow mutual kill).
-            unsigned char P = pprop[i];
-            unsigned char E = eprop[i];
-
-            if (P && !E) {
-                next[idx] = P;
-            } else if (!P && E) {
-                next[idx] = E;
-            } else if (P && E) {
-                unsigned char np = norm(P), ne = norm(E);
-                if (np == ne) {
-                    next[idx] = EMPTY;       // mutual kill
-                    if (env->flash) env->flash[idx] = 10;
-                } else if (beats(P, E)) {
-                    next[idx] = P;
-                    if (env->flash) env->flash[idx] = 10;
-                } else if (beats(E, P)) {
-                    next[idx] = E;
-                    if (env->flash) env->flash[idx] = 10;
-                } else {
-                    next[idx] = EMPTY;       // safety fallback
-                }
-            } else {
-                next[idx] = EMPTY;
-            }
-        }
-
-        free(pprop);
-        free(eprop);
-        free(used);
-        free(occ);
-    }
-
-    memcpy(cur, next, N);
-    free(next);
-}
-
-//  Base damage 
-static inline void base_attack_phase(RoyaleEnv* env){
-    int L = env->length;
-    unsigned char* b = env->observations;
-    int dmgP = 0, dmgE = 0;
-
-    for (int lane = 0; lane < 2; lane++){
-        for (int i = (L >= 2 ? L - 2 : 0); i < L; i++) {
-            if (is_player(b[lane * L + i])) {
-                dmgP++;
-                env->rewards[0] += 0.1;
-            }
-
-        }
-        for (int i = 0; i < L && i <= 1; i++) {
-            if (is_enemy(b[lane * L + i])) {
-                dmgE++;
-                env->rewards[0] -= 0.1;
-            }
-        }
-    }
-
-    env->e_base -= dmgP;
-    env->p_base -= dmgE;
-}
-
-//  Step 
-static inline void c_step(RoyaleEnv* env) {
-    
+// ==============================
+// Step
+// ==============================
+void c_step(RoyaleEnv* env) {
     env->tick++;
+    env->rewards[0] = 0.0f;
     env->terminals[0] = 0;
-    env->rewards[0]   = 0;
+    float prev_elixir = env->elixir_player;  // store before regen/spending
 
-    // snapshot current board for interpolation (globals)
-    if (g_prev && g_prev_len >= 2*env->length) {
-        memcpy(g_prev, env->observations, 2 * env->length);
+    // Regenerate elixir
+    if (env->elixir_player < ELIXIR_MAX) {
+        env->elixir_player += ELIXIR_REGEN;
+        if (env->elixir_player > ELIXIR_MAX) env->elixir_player = ELIXIR_MAX;
     }
-    g_lerp = 0.0f;
-
-    move_and_resolve(env);
-
-    int a = env->actions[0];
-    if      (a == 1) try_spawn_player(env, 0, P_MELEE);
-    else if (a == 2) try_spawn_player(env, 0, P_RANGED);
-    else if (a == 3) try_spawn_player(env, 0, P_FLYING);
-    else if (a == 4) try_spawn_player(env, 1, P_MELEE);
-    else if (a == 5) try_spawn_player(env, 1, P_RANGED);
-    else if (a == 6) try_spawn_player(env, 1, P_FLYING);
-
-    // enemy: at most one attempt per tick (random lane)
-    if (ENEMY_SPAWN_ODDS > 0) {
-        int lane = rand() & 1;
-        maybe_spawn_enemy(env, lane);
+    if (env->elixir_enemy < ELIXIR_MAX) {
+        env->elixir_enemy += ELIXIR_REGEN;
+        if (env->elixir_enemy > ELIXIR_MAX) env->elixir_enemy = ELIXIR_MAX;
     }
 
-    base_attack_phase(env);
-    write_bases(env);
+    // Player action:
+    // 0=noop,
+    // lane 0: 1=K,2=A,3=T,4=F
+    // lane 1: 5=K,6=A,7=T,8=F
+    int action = (int)(env->actions[0] + 0.5f);
+    if (action >= 1 && action <= 8) {
+        int lane = (action >= 5) ? 1 : 0;
+        int type = 1 + ((action - 1) % 4);  // 1..4
+        (void)spawn_unit(env, type, 0, lane);
+    }
 
-    int max_ticks = env->length * MAX_TICKS_FACTOR;
-    if      (env->e_base <= 0) { env->rewards[0] =  1; env->terminals[0] = 1; }
-    else if (env->p_base <= 0) { env->rewards[0] = -1; env->terminals[0] = 1; }
-    else if (env->tick >= max_ticks) { env->rewards[0] = -0.1f; env->terminals[0] = 1; }
+    #if ENEMY_MANUAL
+    // Enemy manual controls (team=1). Raylib input is fine to read here.
+    // Lane 0 (top): U=Knight, I=Archer, O=Tank, P=Flying
+    // Lane 1 (bot): J=Knight, K=Archer, L=Tank, ;=Flying
+    int e_type = 0, e_lane = 0;
 
-    if (env->terminals[0]) { add_log(env); c_reset(env); }
+    if (IsKeyPressed(KEY_U)) { e_type = TROOP_KNIGHT; e_lane = 0; }
+    else if (IsKeyPressed(KEY_I)) { e_type = TROOP_ARCHER; e_lane = 0; }
+    else if (IsKeyPressed(KEY_O)) { e_type = TROOP_TANK;   e_lane = 0; }
+    else if (IsKeyPressed(KEY_P)) { e_type = TROOP_FLYING; e_lane = 0; }
+
+    else if (IsKeyPressed(KEY_J)) { e_type = TROOP_KNIGHT; e_lane = 1; }
+    else if (IsKeyPressed(KEY_K)) { e_type = TROOP_ARCHER; e_lane = 1; }
+    else if (IsKeyPressed(KEY_L)) { e_type = TROOP_TANK;   e_lane = 1; }
+    else if (IsKeyPressed(KEY_SEMICOLON)) { e_type = TROOP_FLYING; e_lane = 1; }
+
+    if (e_type > 0) {
+        (void)spawn_unit(env, e_type, 1, e_lane); // respects enemy elixir
+    }
+    #else
+        // Original enemy AI (or your improved saver/bias block)
+        if (rand() % 3 == 0) {
+            int t = random_affordable_enemy_type(env);
+        if (t) {
+            int lane = rand() & 1;
+            (void)spawn_unit(env, t, 1, lane);  // spawn_unit already deducts elixir
+        }
+        }
+    #endif
+
+
+    // Move and attack units
+    for (int i = 0; i < env->num_units; i++) {
+        Unit* u = &env->units[i];
+        if (!u->active) continue;
+
+        // Tower on same lane
+        float tower_x = (u->team == 0) ? (WIDTH - 2.0f) : 1.0f;
+        float tower_y = u->y;
+        float dxT = u->x - tower_x, dyT = u->y - tower_y;
+        float dist_to_tower = sqrtf(dxT*dxT + dyT*dyT);
+
+        float nearest_dist;
+        int   nearest_idx;
+
+        if (u->lock_tower) {
+            // Once locked, ignore new spawns
+            nearest_idx  = -1;
+            nearest_dist = dist_to_tower;
+        } else {
+            // Normal: prefer tower, but can switch to enemy if closer
+            nearest_idx  = -1;
+            nearest_dist = dist_to_tower;
+
+            // Search enemies on same lane that this unit can attack
+            for (int j = 0; j < env->num_units; j++) {
+                Unit* other = &env->units[j];
+                if (!other->active || other->team == u->team) continue;
+                if ((int)other->y != (int)u->y) continue;
+                if (!can_attack_type(u->type, other->type)) continue;
+
+                float dx = u->x - other->x;
+                float dy = u->y - other->y;
+                float d  = sqrtf(dx*dx + dy*dy);
+                if (d < nearest_dist) {
+                    nearest_dist = d;
+                    nearest_idx  = j;
+                }
+            }
+        }
+
+        // Attack or move
+        if (nearest_dist <= u->range) {
+            if (u->attack_cooldown <= 0) {
+                if (nearest_idx == -1) {
+                    // Hitting tower: lock permanently
+                    u->lock_tower = 1;   // NEW
+                    if (u->team == 0) {
+                        env->tower_enemy_health -= u->damage;
+                        env->rewards[0] += u->damage / 1000;
+                    } else {
+                        env->tower_player_health -= u->damage;
+                        env->rewards[0] -= u->damage / 1000;
+                    }
+                } else {
+                    // Hitting unit
+                    float dmg = u->damage;
+                    if (u->type == TROOP_ARCHER &&
+                        env->units[nearest_idx].type == TROOP_FLYING) {
+                        dmg *= 3.0f;
+                    }
+                    env->units[nearest_idx].health -= dmg;
+                }
+                u->attack_cooldown = u->attack_rate;
+            } else {
+                u->attack_cooldown--;
+            }
+        } else {
+            // Move
+            if (nearest_idx == -1) {
+                // March toward tower if locked OR tower is current target
+                if (u->team == 0) u->x += u->speed; else u->x -= u->speed;
+            } else {
+                // Move toward enemy (same lane, x-only)
+                Unit* t = &env->units[nearest_idx];
+                float dx = t->x - u->x;
+                float adx = fabsf(dx);
+                if (adx > 1e-6f) u->x += (dx / adx) * u->speed;
+            }
+        }
+
+        // Clamp & keep on lane
+        if (u->x < 0) u->x = 0;
+        if (u->x >= WIDTH) u->x = WIDTH - 1;
+        u->y = (fabsf(u->y - LANE0_Y) < fabsf(u->y - LANE1_Y))
+            ? (float)LANE0_Y : (float)LANE1_Y;
+        }
+
+    // Remove dead units 
+    for (int i = 0; i < env->num_units; i++) { 
+        if (env->units[i].active && env->units[i].health <= 0) { 
+            env->units[i].active = 0; 
+        } 
+    }
+
+    // Check win conditions
+    if (env->tower_enemy_health <= 0) {
+        env->rewards[0] = 2.0f;
+        env->terminals[0] = 1;
+    } else if (env->tower_player_health <= 0) {
+        env->rewards[0] = -2.0f;
+        env->terminals[0] = 1;
+    } else if (env->tick >= MAX_TICKS) {
+        env->rewards[0] = (env->tower_player_health > env->tower_enemy_health) ? 0.1f : -0.1f;
+        env->terminals[0] = 1;
+    }
+
+    
+    float elixir_change = env->elixir_player - prev_elixir;
+    env->rewards[0] += 0.1f * elixir_change;  // small reward for net saving
+
+    if (env->terminals[0]) {
+        // expose the true terminal observation + a safe mask
+        compute_observations(env);
+        set_terminal_mask(env);
+
+        add_log(env);
+        c_reset(env);
+        return;
+    }
+
+    // normal step
+    compute_observations(env);
+    update_action_mask(env);
 }
 
-//  Render 
-static inline void c_render(RoyaleEnv* env) {
-    int L  = env->length;
-    int px = CELL_PX;
+// ==============================
+// Rendering
+// ==============================
 
-    // window width = left gutter + board + right gutter
-    int width  = BOARD_X + px * L + RIGHT_GUTTER;
-    int height = px * 2 + 64;
+Color get_color(unsigned char tile) {
+    switch(tile) {
+        case EMPTY:         return (Color){20, 20, 30, 255};
+        case TOWER_PLAYER:  return (Color){0, 200, 255, 255};
+        case TOWER_ENEMY:   return (Color){255, 100, 100, 255};
+        case KNIGHT_PLAYER: return (Color){0, 150, 255, 255};
+        case ARCHER_PLAYER: return (Color){0, 255, 150, 255};
+        case TANK_PLAYER:   return (Color){100, 100, 255, 255};
+        case KNIGHT_ENEMY:  return (Color){255, 80, 80, 255};
+        case ARCHER_ENEMY:  return (Color){255, 150, 80, 255};
+        case TANK_ENEMY:    return (Color){255, 50, 50, 255};
+        case FLYING_PLAYER: return (Color){120, 200, 255, 255};
+        case FLYING_ENEMY:  return (Color){255, 200, 120, 255};
+        default:            return (Color){128, 128, 128, 255};
+    }
+}
 
+void c_render(RoyaleEnv* env) {
+    // Initialize window on first call
     if (!IsWindowReady()) {
-        InitWindow(width, height, "Royale (Horizontal)");
-        SetTargetFPS(60); // smoother visuals
-        load_sprites_once();
-    } else if (!sprites_loaded) {
-        load_sprites_once();
+        InitWindow(WIDTH * CELL_SIZE, HEIGHT * CELL_SIZE + 100, "PufferLib Royale");
+        SetTargetFPS(30);
     }
 
-    if (IsKeyDown(KEY_ESCAPE)) exit(0);
-
-    // advance interpolation toward 1 between steps (time-based)
-    const float MOVE_TIME_SEC = 0.12f;
-    if (g_lerp < 1.0f) {
-        float da = GetFrameTime() / MOVE_TIME_SEC;
-        g_lerp += da;
-        if (g_lerp > 1.0f) g_lerp = 1.0f;
+    // Load sprites on first render
+    if (!env->sprites_loaded) {
+        env->knight_sprite = LoadTexture("pufferlib/ocean/royale/assets/knight.png");
+        env->archer_sprite = LoadTexture("pufferlib/ocean/royale/assets/archer.png");
+        env->golem_sprite = LoadTexture("pufferlib/ocean/royale/assets/golem.png");
+        env->dragon_sprite = LoadTexture("pufferlib/ocean/royale/assets/dragon.png");
+        env->sprites_loaded = true;
     }
+
+    if (IsKeyDown(KEY_ESCAPE)) {
+        exit(0);
+    }
+
+    int sz = CELL_SIZE;
 
     BeginDrawing();
-    ClearBackground((Color){12,14,22,255});
+    ClearBackground((Color){12, 14, 22, 255});
 
-    // board
-    for (int lane = 0; lane < 2; lane++) {
-        for (int i = 0; i < L; i++) {
-            unsigned char v = env->observations[lane * L + i];
-
-            // background tile
-            DrawRectangle(BOARD_X + i * px, lane * px, px - 1, px - 1, (Color){28,30,40,255});
-
-            // --- compute lerped X using globals ---
-            float alpha = g_lerp;       // 0..1
-            int j_prev = i, j_now = i;
-
-            if (v != 0 && g_prev) {
-                if (is_player(v)) {
-                    if (i > 0 && g_prev[lane * L + (i - 1)] == v) j_prev = i - 1;
-                } else if (is_enemy(v)) {
-                    if (i + 1 < L && g_prev[lane * L + (i + 1)] == v) j_prev = i + 1;
-                }
-            }
-
-            float j_lerped = (1.0f - alpha) * (float)j_prev + alpha * (float)j_now;
-            int   x_px     = BOARD_X + (int)(j_lerped * px);
-            int   y_px     = lane * px;
-
-            // sprite or fallback
-            bool drew_sprite = false;
-            if (sprites_loaded) {
-                Texture2D *tex = NULL;
-                if (v == P_MELEE || v == E_MELEE)         tex = &tex_melee;
-                else if (v == P_RANGED || v == E_RANGED)  tex = &tex_ranged;
-                else if (v == P_FLYING || v == E_FLYING)  tex = &tex_flying;
-
-                if (tex && tex->id != 0) {
-                    int frame = (env->tick / ANIM_SPEED) % 2;
-                    Rectangle src = (Rectangle){ frame * frame_w, 0, frame_w, frame_h };
-                    if (v >= 10) { src.x = frame * frame_w + frame_w; src.width = -frame_w; }
-                    Rectangle dest = (Rectangle){ x_px, y_px, px, px };
-                    DrawTexturePro(*tex, src, dest, (Vector2){0,0}, 0, RAYWHITE);
-                    drew_sprite = true;
-                }
-            }
-
-            // fallback colored block if no sprite
-            if (!drew_sprite && v != 0) {
-                Color c = (Color){28,30,40,255};
-                if (v == P_MELEE)  c = (Color){0,180,255,255};
-                if (v == P_RANGED) c = (Color){0,255,180,255};
-                if (v == P_FLYING) c = (Color){120,200,255,255};
-                if (v == E_MELEE)  c = (Color){255,90,90,255};
-                if (v == E_RANGED) c = (Color){255,160,90,255};
-                if (v == E_FLYING) c = (Color){255,200,120,255};
-                DrawRectangle(x_px + 6, y_px + 6, px - 12, px - 12, c);
-            }
-
-            // TEAM OUTLINE (player = cyan, enemy = red)
-            if (v != 0) {
-                Color outline = (v >= 10) ? (Color){255,120,120,255} : (Color){0,200,255,255};
-                DrawRectangleLinesEx(
-                    (Rectangle){ x_px + 1, y_px + 1, px - 2, px - 2 },
-                    2.0f, outline);
-            }
-
-            // CLASH FLASH (pulsing yellow border where a fight resolved)
-            int idx = lane * L + i;
-            if (env->flash && env->flash[idx] > 0) {
-                int a = 40 + env->flash[idx] * 20; if (a > 255) a = 255;
-                Color flash = (Color){255, 220, 80, a};
-                DrawRectangleLinesEx(
-                    (Rectangle){ x_px + 3, y_px + 3, px - 6, px - 6 },
-                    3.0f, flash);
+    // Draw grid (row-major indexing: y * WIDTH + x)
+    // Only draw towers, skip unit tiles since we draw sprites instead
+    for (int y = 0; y < env->height; y++) {
+        for (int x = 0; x < env->width; x++) {
+            unsigned char tile = env->grid[y * WIDTH + x];
+            // Only draw tower tiles and empty background, skip unit tiles
+            if (tile == TOWER_PLAYER || tile == TOWER_ENEMY || tile == EMPTY) {
+                DrawRectangle(x * sz, y * sz, sz - 2, sz - 2, get_color(tile));
             }
         }
     }
 
-    int center_y = px - 6;
-    DrawRectangle(BOARD_X - 20,          center_y, 12, 12, (Color){0,200,255,255}); // Player base (left of board)
-    DrawRectangle(BOARD_X + px * L + 8,  center_y, 12, 12, (Color){255,120,120,255}); // Enemy base (right of board)
+    // Draw units with sprites (explicit mapping to support flying)
+    for (int i = 0; i < env->num_units; i++) {
+        Unit* u = &env->units[i];
+        if (!u->active) continue;
 
-    // fade clash flashes
-    if (env->flash) {
-        int N = 2 * env->length;
-        for (int k = 0; k < N; k++) if (env->flash[k] > 0) env->flash[k]--;
+        // Convert grid coordinates to pixel coordinates
+        float px = u->x * sz;
+        float py = u->y * sz;
+
+        // Select sprite based on troop type
+        Texture2D sprite;
+        if (u->type == TROOP_KNIGHT) {
+            sprite = env->knight_sprite;
+        } else if (u->type == TROOP_ARCHER) {
+            sprite = env->archer_sprite;
+        } else if (u->type == TROOP_TANK) {
+            sprite = env->golem_sprite;
+        } else if (u->type == TROOP_FLYING) {
+            sprite = env->dragon_sprite;
+        } else {
+            sprite = env->knight_sprite; // fallback
+        }
+
+        // Draw sprite (flip source rectangle for enemies to face left)
+        Rectangle source;
+        if (u->team == 0) {
+            // Player: face right (normal)
+            source = (Rectangle){0, 0, (float)sprite.width, (float)sprite.height};
+        } else {
+            // Enemy: face left (flip by reversing source x)
+            source = (Rectangle){(float)sprite.width, 0, -(float)sprite.width, (float)sprite.height};
+        }
+
+        Rectangle dest = {px, py, (float)sz, (float)sz};
+        DrawTexturePro(sprite, source, dest, (Vector2){0, 0}, 0, WHITE);
+
+        // Health bar above unit
+        float hp_pct = u->health / u->max_health;
+        if (hp_pct < 0) hp_pct = 0;
+        if (hp_pct > 1) hp_pct = 1;
+        int bar_width = (int)(sz * hp_pct);
+
+        // Draw background (red) then foreground (green)
+        DrawRectangle((int)px, (int)py - 6, sz, 4, RED);
+        DrawRectangle((int)px, (int)py - 6, bar_width, 4, GREEN);
     }
 
-    // HUD
-    int hud_x = 8, hud_y = px * 2 + 12;
-    DrawText("Agent Base:", hud_x, hud_y, 16, RAYWHITE);
-    DrawRectangle(hud_x + 72, hud_y + 2,  (env->p_base > 0 ? env->p_base : 0) * 8, 10, (Color){0,200,255,255});
-    DrawText("Enemy Base:", hud_x, hud_y + 22, 16, RAYWHITE);
-    DrawRectangle(hud_x + 72, hud_y + 24, (env->e_base > 0 ? env->e_base : 0) * 8, 10, (Color){255,120,120,255});
-
-    // Overlay a warning if sprites failed to load
-    if (!sprites_loaded) {
-        DrawText("Sprites not found. Showing fallbacks.",
-                 width - 320, height - 22, 16, (Color){255,200,120,255});
-    }
+    // HUD at bottom
+    int hud_y = HEIGHT * sz + 10;
+    DrawText(TextFormat("Tower HP: %.0f", env->tower_player_health), 10, hud_y, 16, WHITE);
+    DrawText(TextFormat("Enemy Tower: %.0f", env->tower_enemy_health), 10, hud_y + 20, 16, WHITE);
+    DrawText(TextFormat("Elixir: %.1f", env->elixir_player), 10, hud_y + 40, 16, WHITE);
+    DrawText(TextFormat("Units: %d", env->num_units), 10, hud_y + 60, 16, WHITE);
+    DrawText("Actions: lane0 1-4=K/A/T/F, lane1 5-8=K/A/T/F", 250, hud_y, 14, GRAY);
 
     EndDrawing();
 }
 
-//  Close 
-static inline void c_close(RoyaleEnv* env) {
-    (void)env;
-    if (tex_melee.id)  UnloadTexture(tex_melee);
-    if (tex_ranged.id) UnloadTexture(tex_ranged);
-    if (tex_flying.id) UnloadTexture(tex_flying);
-    if (IsWindowReady()) CloseWindow();
-}
-
-#ifdef __cplusplus
-}
-#endif
-#endif
