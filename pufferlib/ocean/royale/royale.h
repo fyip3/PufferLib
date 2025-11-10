@@ -6,9 +6,8 @@
 #include <time.h>
 #include "raylib.h"
 
-// ==============================
+
 // Config
-// ==============================
 #define WIDTH 20
 #define HEIGHT 10
 #define CELL_SIZE 32
@@ -50,9 +49,8 @@
 #define ENEMY_MANUAL 0   // set to 0 to restore AI
 #endif
 
-// ==============================
+
 // Types
-// ==============================
 typedef struct Log Log;
 struct Log {
     float perf;
@@ -94,7 +92,15 @@ struct RoyaleEnv {
     float tower_enemy_health;
     float elixir_player;
     float elixir_enemy;
+
     int tick;
+    int cd;
+
+    // Tower per-lane cooldowns and locked targets (-1 = none)
+    float tower_cd_player[LANES];
+    float tower_cd_enemy[LANES];
+    int   tower_target_player[LANES];
+    int   tower_target_enemy[LANES];
 
     // Sprite textures
     Texture2D knight_sprite;
@@ -109,14 +115,14 @@ struct RoyaleEnv {
     int obs_size;
     int length;  // For compatibility with binding.c
 
-    // ===== Action mask (NEW) =====
+    // Action mask
     unsigned char* action_mask; // size 9: 0..8 (0=noop)
     int action_mask_size;       // = 9
 };
 
-// ==============================
+
 // Troop stats
-// ==============================
+
 typedef struct TroopStats {
     float health;
     float damage;
@@ -130,15 +136,14 @@ typedef struct TroopStats {
 static const TroopStats TROOP_DATA[] = {
     {0,   0,   0.0f, 0.0f,   0, 0},    // 0 = none
    //HP   DMG  SPEED  RANGE  ATK_RATE  COST
-    {130, 15,  1.00f, 1.20f,    45,     3},  // 1 = Knight  (slight nerf: atk slower, a bit less HP)
-    { 60,  7,  0.90f, 4.80f,    28,     2},  // 2 = Archer  (anti-air; a touch slower/weaker vs ground)
-    {420, 50,  0.70f, 1.80f,    45,     5},  // 3 = Tank    (buffed: bigger HP/DMG/range; higher cost -> save pays off)
-    {100, 30,  1.25f, 2.00f,    28,     4},  // 4 = Flying  (buffed: faster/stronger; still loses hard to Archer via your 2x bonus)
+    {130, 1,  0.05f, 1.20f,    45,     3},  // 1 = Knight  (slight nerf: atk slower, a bit less HP)
+    { 30,  1,  0.045f, 3.80f,    45,     2},  // 2 = Archer  (anti-air; a touch slower/weaker vs ground)
+    {420, 100,  0.045f, 1.80f,    90,     5},  // 3 = Tank    (buffed: bigger HP/DMG/range; higher cost -> save pays off)
+    {100, 30,  0.0625f, 2.00f,    45,     5},  // 4 = Flying  (buffed: faster/stronger; still loses hard to Archer via 2x bonus)
 };
 
-// ==============================
+
 // Helpers for flying rules
-// ==============================
 static inline bool is_flying_type(int t) { return t == TROOP_FLYING; }
 static inline bool can_attack_type(int attacker_type, int target_type) {
     // Knights & Tanks cannot hit air
@@ -148,9 +153,8 @@ static inline bool can_attack_type(int attacker_type, int target_type) {
     return true;
 }
 
-// ==============================
+
 // Logging
-// ==============================
 void add_log(RoyaleEnv* env) {
     float score = env->tower_player_health - env->tower_enemy_health;
     env->log.episode_length += env->tick;
@@ -167,6 +171,18 @@ void init(RoyaleEnv* env) {
     env->obs_size = WIDTH * HEIGHT + 4;  // grid + tower HPs + elixirs
     env->num_units = 0;
     env->sprites_loaded = false;
+    env->cd = 0;
+
+
+
+    // Initialize tower arrays
+    for (int i = 0; i < LANES; i++) {
+        env->tower_cd_player[i] = 0;
+        env->tower_cd_enemy[i] = 0;
+        env->tower_target_player[i] = -1;
+        env->tower_target_enemy[i] = -1;
+    }
+
     memset(&env->log, 0, sizeof(Log));
 }
 
@@ -179,7 +195,7 @@ void allocate(RoyaleEnv* env) {
     env->rewards = (float*)calloc(1, sizeof(float));
     env->terminals = (unsigned char*)calloc(1, sizeof(unsigned char));
 
-    // action mask (NEW)
+    // action mask
     env->action_mask_size = 9;
     env->action_mask = (unsigned char*)calloc(env->action_mask_size, 1);
 }
@@ -191,7 +207,7 @@ void free_allocated(RoyaleEnv* env) {
     free(env->actions);
     free(env->rewards);
     free(env->terminals);
-    free(env->action_mask); // NEW
+    free(env->action_mask); 
 }
 
 void c_close(RoyaleEnv* env) {
@@ -204,7 +220,7 @@ void c_close(RoyaleEnv* env) {
         env->sprites_loaded = false;
     }
 
-    // Free environment-specific buffers (NOT the Python numpy arrays)
+    // Free environment-specific buffers
     if (env->grid) {
         free(env->grid);
         env->grid = NULL;
@@ -219,9 +235,8 @@ void c_close(RoyaleEnv* env) {
     }
 }
 
-// ==============================
+
 // Unit management
-// ==============================
 int spawn_unit(RoyaleEnv* env, int type, int team, int lane) {
     if (lane < 0 || lane >= LANES) return -1;
     if (env->num_units >= MAX_UNITS) return -1;
@@ -256,7 +271,7 @@ int spawn_unit(RoyaleEnv* env, int type, int team, int lane) {
 static inline int random_affordable_enemy_type(RoyaleEnv* env){
     int candidates[4]; int n = 0;
     for (int t = 1; t <= 4; ++t){
-        if (TROOP_DATA[t].cost <= 3 &&
+        if (TROOP_DATA[t].cost <= 5 &&
             env->elixir_enemy >= (float)TROOP_DATA[t].cost){
             candidates[n++] = t;
         }
@@ -265,9 +280,27 @@ static inline int random_affordable_enemy_type(RoyaleEnv* env){
     return candidates[rand() % n];      // pick a cheap, affordable type
 }
 
-// ==============================
-// Action mask helpers (NEW)
-// ==============================
+// Nearest enemy in same lane within range; -1 if none
+static inline int acquire_tower_target(RoyaleEnv* env, int shooter_team,
+                                       float tx, float ty, float range)
+{
+    int best = -1;
+    float bestd = 1e9f;
+    for (int i = 0; i < env->num_units; i++) {
+        Unit *u = &env->units[i];
+        if (!u->active || u->team == shooter_team) continue;      // enemy only
+        if ((int)u->y != (int)ty) continue;                        // same lane
+
+        float dx = u->x - tx, dy = u->y - ty;
+        float d  = sqrtf(dx*dx + dy*dy);
+        if (d <= range && d < bestd) { bestd = d; best = i; }
+    }
+    return best;
+}
+
+
+
+// Action mask helpers 
 static inline void update_action_mask(RoyaleEnv* env) {
     // 9 discrete actions: 0=noop,
     // lane 0: 1=K,2=A,3=T,4=F
@@ -292,9 +325,8 @@ static inline void set_terminal_mask(RoyaleEnv* env) {
     env->action_mask[0] = 1;  // only noop allowed on terminal frame
 }
 
-// ==============================
+
 // Observations
-// ==============================
 void compute_observations(RoyaleEnv* env) {
     // Clear grid
     memset(env->grid, EMPTY, WIDTH * HEIGHT);
@@ -339,9 +371,8 @@ void compute_observations(RoyaleEnv* env) {
     env->observations[WIDTH * HEIGHT + 3] = env->elixir_enemy / ELIXIR_MAX;
 }
 
-// ==============================
+
 // Reset
-// ==============================
 void c_reset(RoyaleEnv* env) {
     env->tick = 0;
     env->num_units = 0;
@@ -349,6 +380,14 @@ void c_reset(RoyaleEnv* env) {
     env->tower_enemy_health = 1000.0f;
     env->elixir_player = ELIXIR_START;
     env->elixir_enemy = ELIXIR_START;
+    env->cd = 0;
+
+    for (int l = 0; l < LANES; l++) {
+        env->tower_cd_player[l] = 0;
+        env->tower_cd_enemy[l]  = 0;
+        env->tower_target_player[l] = -1;
+        env->tower_target_enemy[l]  = -1;
+    }
 
     memset(env->grid, EMPTY, WIDTH * HEIGHT);
     memset(env->units, 0, MAX_UNITS * sizeof(Unit));
@@ -357,9 +396,8 @@ void c_reset(RoyaleEnv* env) {
     update_action_mask(env); // keep mask consistent after reset (NEW)
 }
 
-// ==============================
+
 // Step
-// ==============================
 void c_step(RoyaleEnv* env) {
     env->tick++;
     env->rewards[0] = 0.0f;
@@ -380,12 +418,21 @@ void c_step(RoyaleEnv* env) {
     // 0=noop,
     // lane 0: 1=K,2=A,3=T,4=F
     // lane 1: 5=K,6=A,7=T,8=F
-    int action = (int)(env->actions[0] + 0.5f);
-    if (action >= 1 && action <= 8) {
-        int lane = (action >= 5) ? 1 : 0;
-        int type = 1 + ((action - 1) % 4);  // 1..4
-        (void)spawn_unit(env, type, 0, lane);
+    // Player action every DECISION_PERIOD ticks
+    if (env->cd <= 0) {
+        int action = (int)(env->actions[0] + 0.5f);
+        if (action >= 1 && action <= 8) {
+            int lane = (action >= 5) ? 1 : 0;
+            int type = 1 + ((action - 1) % 4);  // 1..4
+            if(spawn_unit(env, type, 0, lane) == -1) {
+                env->rewards[0] -= 0.05f;
+            }
+        }
+        env->cd = 5;
+    } else {
+        env->cd--;
     }
+
 
     #if ENEMY_MANUAL
     // Enemy manual controls (team=1). Raylib input is fine to read here.
@@ -407,14 +454,14 @@ void c_step(RoyaleEnv* env) {
         (void)spawn_unit(env, e_type, 1, e_lane); // respects enemy elixir
     }
     #else
-        // Original enemy AI (or your improved saver/bias block)
-        if (rand() % 3 == 0) {
-            int t = random_affordable_enemy_type(env);
+        // Original enemy AI
+
+        int t = random_affordable_enemy_type(env);
         if (t) {
             int lane = rand() & 1;
             (void)spawn_unit(env, t, 1, lane);  // spawn_unit already deducts elixir
         }
-        }
+        
     #endif
 
 
@@ -463,7 +510,7 @@ void c_step(RoyaleEnv* env) {
             if (u->attack_cooldown <= 0) {
                 if (nearest_idx == -1) {
                     // Hitting tower: lock permanently
-                    u->lock_tower = 1;   // NEW
+                    u->lock_tower = 1; 
                     if (u->team == 0) {
                         env->tower_enemy_health -= u->damage;
                         env->rewards[0] += u->damage / 1000;
@@ -476,7 +523,6 @@ void c_step(RoyaleEnv* env) {
                     float dmg = u->damage;
                     if (u->type == TROOP_ARCHER &&
                         env->units[nearest_idx].type == TROOP_FLYING) {
-                        dmg *= 3.0f;
                     }
                     env->units[nearest_idx].health -= dmg;
                 }
@@ -503,21 +549,100 @@ void c_step(RoyaleEnv* env) {
         if (u->x >= WIDTH) u->x = WIDTH - 1;
         u->y = (fabsf(u->y - LANE0_Y) < fabsf(u->y - LANE1_Y))
             ? (float)LANE0_Y : (float)LANE1_Y;
+    }
+
+    // Tower attacks: lock-on until target dies 
+    {
+        const float t_range = TROOP_DATA[TROOP_ARCHER].range;
+        const float t_rate  = 38;
+        const float t_dmg   = TROOP_DATA[TROOP_ARCHER].health / 3.0f;
+
+        // Player towers (team 0) shoot enemies (team 1)
+        for (int l = 0; l < LANES; l++) {
+            const float tx = 1.0f;
+            const float ty = (l == 0) ? (float)LANE0_Y : (float)LANE1_Y;
+
+            if (env->tower_cd_player[l] > 0) env->tower_cd_player[l]--;
+
+            int t = env->tower_target_player[l];
+            bool valid = false;
+            if (t >= 0 && t < env->num_units) {
+                Unit *u = &env->units[t];
+                if (u->active && u->team == 1 && (int)u->y == (int)ty) {
+                    float dx = u->x - tx, dy = u->y - ty;
+                    float d  = sqrtf(dx*dx + dy*dy);
+                    valid = (d <= t_range);
+                }
+            }
+            if (!valid) {
+                t = acquire_tower_target(env, /*shooter_team=*/0, tx, ty, t_range);
+                env->tower_target_player[l] = t;
+            }
+            if (t != -1 && env->tower_cd_player[l] <= 0) {
+                env->units[t].health -= t_dmg;
+                env->tower_cd_player[l] = t_rate;
+            }
         }
 
-    // Remove dead units 
-    for (int i = 0; i < env->num_units; i++) { 
-        if (env->units[i].active && env->units[i].health <= 0) { 
-            env->units[i].active = 0; 
-        } 
+        // Enemy towers (team 1) shoot player units (team 0)
+        for (int l = 0; l < LANES; l++) {
+            const float tx = (float)(WIDTH - 2);
+            const float ty = (l == 0) ? (float)LANE0_Y : (float)LANE1_Y;
+
+            if (env->tower_cd_enemy[l] > 0) env->tower_cd_enemy[l]--;
+
+            int t = env->tower_target_enemy[l];
+            bool valid = false;
+            if (t >= 0 && t < env->num_units) {
+                Unit *u = &env->units[t];
+                if (u->active && u->team == 0 && (int)u->y == (int)ty) {
+                    float dx = u->x - tx, dy = u->y - ty;
+                    float d  = sqrtf(dx*dx + dy*dy);
+                    valid = (d <= t_range);
+                }
+            }
+            if (!valid) {
+                t = acquire_tower_target(env, /*shooter_team=*/1, tx, ty, t_range);
+                env->tower_target_enemy[l] = t;
+            }
+            if (t != -1 && env->tower_cd_enemy[l] <= 0) {
+                env->units[t].health -= t_dmg;
+                env->tower_cd_enemy[l] = t_rate;
+            }
+        }
     }
+
+    
+ 
+    // Remove dead units and reward for kills
+    for (int i = 0; i < env->num_units; i++) {
+        Unit* u = &env->units[i];
+        if (!u->active) continue;
+
+        if (u->health <= 0) {
+            u->active = 0;
+
+            // Fetch the troop's elixir cost for scaling
+            int cost = TROOP_DATA[u->type].cost;
+            float reward = cost * 0.05f;  // ≈0.1 for archers, 0.15 for knights, 0.25 for tanks
+
+            if (u->team == 1) {
+                // Enemy died → reward player
+               // env->rewards[0] += reward;
+            } else if (u->team == 0) {
+                // Our unit died → slight penalty
+              //  env->rewards[0] -= reward * 0.5f;
+            }
+        }
+    }
+
 
     // Check win conditions
     if (env->tower_enemy_health <= 0) {
-        env->rewards[0] = 2.0f;
+        env->rewards[0] = 5.0f;
         env->terminals[0] = 1;
     } else if (env->tower_player_health <= 0) {
-        env->rewards[0] = -2.0f;
+        env->rewards[0] = -5.0f;
         env->terminals[0] = 1;
     } else if (env->tick >= MAX_TICKS) {
         env->rewards[0] = (env->tower_player_health > env->tower_enemy_health) ? 0.1f : -0.1f;
@@ -525,8 +650,8 @@ void c_step(RoyaleEnv* env) {
     }
 
     
-    float elixir_change = env->elixir_player - prev_elixir;
-    env->rewards[0] += 0.1f * elixir_change;  // small reward for net saving
+    //float elixir_change = env->elixir_player - prev_elixir;
+    //env->rewards[0] += 0.1f * elixir_change;  // small reward for net saving
 
     if (env->terminals[0]) {
         // expose the true terminal observation + a safe mask
@@ -543,9 +668,8 @@ void c_step(RoyaleEnv* env) {
     update_action_mask(env);
 }
 
-// ==============================
+
 // Rendering
-// ==============================
 
 Color get_color(unsigned char tile) {
     switch(tile) {

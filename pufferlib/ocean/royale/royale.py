@@ -23,9 +23,10 @@ class Royale(pufferlib.PufferEnv):
             low=0, high=1.0, shape=(obs_len,), dtype=np.float32
         )
         # Royale action space: 0=noop, 1=knight, 2=archer, 3=tank
-        self.single_action_space = gymnasium.spaces.Discrete(7)
+        self.single_action_space = gymnasium.spaces.Discrete(9)
 
         self.render_mode = render_mode
+        self.num_envs = int(num_envs)
         self.num_agents = num_envs
         self.log_interval = log_interval
 
@@ -81,7 +82,7 @@ if __name__ == "__main__":
     steps = 0
 
     CACHE = 1024
-    actions = np.random.randint(0, 4, (CACHE, N))  # 4 actions: 0-3
+    actions = np.random.randint(0, 9, (CACHE, N))  # 9 actions: 0-8
 
     i = 0
     import time

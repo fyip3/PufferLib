@@ -12,6 +12,17 @@ static int my_init(Env* env, PyObject* args, PyObject* kwargs){
   env->height = HEIGHT;
   env->obs_size = WIDTH * HEIGHT + 4;
   env->num_units = 0;
+  env->sprites_loaded = false;
+  env->cd = 0;
+
+  // Initialize tower arrays
+  for (int i = 0; i < LANES; i++) {
+    env->tower_cd_player[i] = 0;
+    env->tower_cd_enemy[i] = 0;
+    env->tower_target_player[i] = -1;
+    env->tower_target_enemy[i] = -1;
+  }
+
   memset(&env->log, 0, sizeof(Log));
 
   // Allocate environment-specific buffers (NOT the Python numpy arrays)
